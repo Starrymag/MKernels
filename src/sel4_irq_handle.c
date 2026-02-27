@@ -11,53 +11,79 @@
 /* IRQ storm device layout */
 
 #define STORM_IOBASE     0x560
-#define STORM_IOSIZE     0x10
+#define STORM_IOSIZE     0x20
 
 #define REG_CTRL         (STORM_IOBASE + 0x00)
 #define REG_IRQ          (STORM_IOBASE + 0x01)
 #define REG_BURST        (STORM_IOBASE + 0x02)
 #define REG_STATUS       (STORM_IOBASE + 0x03)
 #define REG_PERIOD_US    (STORM_IOBASE + 0x04)
+
 #define REG_PULSES_LO    (STORM_IOBASE + 0x08)
 #define REG_PULSES_HI    (STORM_IOBASE + 0x0C)
+#define REG_TIMER_CB     (STORM_IOBASE + 0x10)
+#define REG_CFG_WRITES   (STORM_IOBASE + 0x14)
+#define REG_EN_TOGGLES   (STORM_IOBASE + 0x18)
+#define REG_ACK          (STORM_IOBASE + 0x1C)
 
 #define STORM_IRQ        5
 
+#define CTRL_ENABLE      (1u << 0)
+#define CTRL_LEVEL       (1u << 1)
+
+#define STATUS_ENABLED   (1u << 0)
+#define STATUS_ASSERT    (1u << 1)
+#define STATUS_LEVEL     (1u << 2)
+
 static simple_t simple;
-
-/* CSlot window allocator */
-
-static seL4_CPtr next_free_slot;
-
-static seL4_CPtr alloc_cslot_or_die(seL4_BootInfo *bi)
-{
-    if (next_free_slot == 0) {
-        next_free_slot = bi->empty.start;
-    }
-    if (next_free_slot >= bi->empty.end) {
-        printf("Out of empty CSlots\n");
-        seL4_DebugHalt();
-    }
-    return next_free_slot++;
-}
 
 static seL4_CPtr find_untyped_or_die(seL4_BootInfo *bi, uint8_t min_size_bits)
 {
     for (seL4_CPtr ut = bi->untyped.start; ut < bi->untyped.end; ut++) {
         int idx = (int)(ut - bi->untyped.start);
-
         if (bi->untypedList[idx].isDevice) {
             continue;
         }
-
         if (bi->untypedList[idx].sizeBits >= min_size_bits) {
             return ut;
         }
     }
-
     printf("No suitable untyped found\n");
     seL4_DebugHalt();
     return 0;
+}
+
+typedef struct {
+    seL4_CPtr cur;
+    seL4_CPtr end;
+} cslot_window_t;
+
+static cslot_window_t reserve_cslot_window_from_end(seL4_BootInfo *bi, seL4_Word nslots)
+{
+    if (nslots == 0) {
+        printf("reserve_cslot_window_from_end: nslots=0\n");
+        seL4_DebugHalt();
+    }
+
+    seL4_Word avail = bi->empty.end - bi->empty.start;
+    if (nslots > avail) {
+        printf("Not enough empty CSlots\n");
+        seL4_DebugHalt();
+    }
+
+    cslot_window_t w;
+    w.end = bi->empty.end;
+    w.cur = bi->empty.end - nslots;
+    return w;
+}
+
+static seL4_CPtr cslot_alloc_or_die(cslot_window_t *w)
+{
+    if (w->cur >= w->end) {
+        printf("CSlot window exhausted\n");
+        seL4_DebugHalt();
+    }
+    return w->cur++;
 }
 
 /* x86 I/O helpers */
@@ -88,39 +114,34 @@ static inline void io_out8(seL4_X86_IOPort io, uint16_t port, uint8_t val)
     }
 }
 
-typedef struct {
-    seL4_CPtr cur;
-    seL4_CPtr end;
-} cslot_window_t;
-
-/* Reserve a block of CSlots from BootInfo empty range */
-
-static cslot_window_t reserve_cslot_window_from_end(seL4_BootInfo *bi, seL4_Word nslots)
+static inline void io_out32(seL4_X86_IOPort io, uint16_t port, uint32_t val)
 {
-    if (nslots == 0) {
-        printf("reserve_cslot_window_from_end: nslots=0\n");
-        seL4_DebugHalt();
+    int err = seL4_X86_IOPort_Out32(io, port, val);
+    if (err) {
+        printf("IOPort_Out32 err=%d port=0x%x\n", err, port);
     }
-
-    seL4_Word avail = bi->empty.end - bi->empty.start;
-    if (nslots > avail) {
-        printf("Not enough empty CSlots\n");
-        seL4_DebugHalt();
-    }
-
-    cslot_window_t w;
-    w.end = bi->empty.end;
-    w.cur = bi->empty.end - nslots;
-    return w;
 }
 
-static seL4_CPtr cslot_alloc_or_die(cslot_window_t *w)
+static inline uint64_t read_u64_lohi_stable(seL4_X86_IOPort io, uint16_t lo_port, uint16_t hi_port)
 {
-    if (w->cur >= w->end) {
-        printf("CSlot window exhausted\n");
-        seL4_DebugHalt();
-    }
-    return w->cur++;
+    uint32_t hi1, hi2, lo;
+    do {
+        hi1 = io_in32(io, hi_port);
+        lo  = io_in32(io, lo_port);
+        hi2 = io_in32(io, hi_port);
+    } while (hi1 != hi2);
+    return ((uint64_t)hi2 << 32) | lo;
+}
+
+static inline void print_cfg(seL4_X86_IOPort io)
+{
+    uint8_t ctrl = io_in8(io, REG_CTRL);
+    uint8_t status = io_in8(io, REG_STATUS);
+    uint32_t burst = io_in8(io, REG_BURST);
+    uint32_t period = io_in32(io, REG_PERIOD_US);
+
+    printf("cfg: ctrl=0x%02x status=0x%02x burst=%u period-us=%u\n",
+           (unsigned)ctrl, (unsigned)status, (unsigned)burst, (unsigned)period);
 }
 
 int main(void)
@@ -129,27 +150,16 @@ int main(void)
     assert(bi);
     simple_default_init_bootinfo(&simple, bi);
 
-    printf("seL4 pc99: isa-irq-storm demo start\n");
+    printf("seL4 pc99: isa-irq-storm demo start (new device, no DebugRunTime)\n");
 
     cslot_window_t win = reserve_cslot_window_from_end(bi, 32);
 
     seL4_CPtr ntfn_slot   = cslot_alloc_or_die(&win);
     seL4_CPtr irqh_slot   = cslot_alloc_or_die(&win);
     seL4_CPtr ioport_slot = cslot_alloc_or_die(&win);
-    seL4_CPtr extra1      = cslot_alloc_or_die(&win);
+    (void)cslot_alloc_or_die(&win);
 
     seL4_CPtr ut = find_untyped_or_die(bi, seL4_NotificationBits);
-
-    printf("empty slots: [%lu .. %lu)\n",
-           (unsigned long)bi->empty.start,
-           (unsigned long)bi->empty.end);
-
-    printf("using slots: ntfn=%lu irqh=%lu ioport=%lu\n",
-           (unsigned long)ntfn_slot,
-           (unsigned long)irqh_slot,
-           (unsigned long)ioport_slot);
-
-    /* Create Notification */
 
     seL4_Error err = seL4_Untyped_Retype(
         ut,
@@ -164,8 +174,6 @@ int main(void)
     assert(err == 0);
     seL4_CPtr ntfn = ntfn_slot;
 
-    /* Issue IOPort capability */
-
     err = seL4_X86_IOPortControl_Issue(
         seL4_CapIOPortControl,
         STORM_IOBASE,
@@ -176,8 +184,6 @@ int main(void)
     );
     assert(err == 0);
     seL4_X86_IOPort io = (seL4_X86_IOPort)ioport_slot;
-
-    /* Obtain IRQ handler via IOAPIC */
 
     err = seL4_IRQControl_GetIOAPIC(
         seL4_CapIRQControl,
@@ -198,40 +204,81 @@ int main(void)
     err = seL4_IRQHandler_Ack(irq_handler);
     assert(err == 0);
 
-    printf("Bound IRQ %d to notification. Enabling device...\n", STORM_IRQ);
+    printf("Device reports IRQ line: %u\n", (unsigned)io_in8(io, REG_IRQ));
+    print_cfg(io);
 
-    /* Enable device */
+    /* Ensure enabled (do not change LEVEL bit set by QEMU unless you want to) */
+    uint8_t ctrl = io_in8(io, REG_CTRL);
+    if (!(ctrl & CTRL_ENABLE)) {
+        ctrl |= CTRL_ENABLE;
+        io_out8(io, REG_CTRL, ctrl);
+    }
 
-    uint8_t irq_line = io_in8(io, REG_IRQ);
-    printf("Storm device reports IRQ line: %u\n", (unsigned)irq_line);
+    /* Reporting cadence: every N handled notifications */
+    const uint64_t report_every_handled = 1ULL << 16; /* 65536 */
+    uint64_t handled = 0;
 
-    io_out8(io, REG_CTRL, 0x1);
+    uint64_t last_pulses = read_u64_lohi_stable(io, REG_PULSES_LO, REG_PULSES_HI);
+    uint32_t last_timer_cb = io_in32(io, REG_TIMER_CB);
+    uint32_t last_cfg_writes = io_in32(io, REG_CFG_WRITES);
+    uint32_t last_en_toggles = io_in32(io, REG_EN_TOGGLES);
 
-    printf("Initial burst=%u status=0x%02x period-us=%u\n",
-           (unsigned)io_in8(io, REG_BURST),
-           (unsigned)io_in8(io, REG_STATUS),
-           (unsigned)io_in32(io, REG_PERIOD_US));
-
-    /* IRQ handling loop */
+    seL4_Word last_badge = 0;
+    uint8_t last_status = io_in8(io, REG_STATUS);
 
     while (1) {
         seL4_Word badge = 0;
         seL4_Wait(ntfn, &badge);
+        handled++;
+        last_badge = badge;
 
-        uint32_t pulses_lo = io_in32(io, REG_PULSES_LO);
-        uint32_t pulses_hi = io_in32(io, REG_PULSES_HI);
-        uint64_t pulses = ((uint64_t)pulses_hi << 32) | pulses_lo;
-
+        /* Minimal per-IRQ work */
         uint8_t status = io_in8(io, REG_STATUS);
+        last_status = status;
 
-        printf("IRQ storm: pulses=%llu status=0x%02x badge=0x%lx\n",
-               (unsigned long long)pulses,
-               (unsigned)status,
-               (unsigned long)badge);
+        /* If device is in LEVEL mode and currently asserted, ACK it */
+        if ((status & STATUS_LEVEL) && (status & STATUS_ASSERT)) {
+            io_out32(io, REG_ACK, 1);
+        }
 
         err = seL4_IRQHandler_Ack(irq_handler);
         if (err) {
             printf("IRQHandler_Ack error: %d\n", (int)err);
+        }
+
+        if ((handled & (report_every_handled - 1)) == 0) {
+            uint64_t pulses = read_u64_lohi_stable(io, REG_PULSES_LO, REG_PULSES_HI);
+            uint32_t timer_cb = io_in32(io, REG_TIMER_CB);
+            uint32_t cfg_writes = io_in32(io, REG_CFG_WRITES);
+            uint32_t en_toggles = io_in32(io, REG_EN_TOGGLES);
+
+            uint64_t dpulses = pulses - last_pulses;
+            uint32_t dtimer_cb = timer_cb - last_timer_cb;
+            uint32_t dcfg = cfg_writes - last_cfg_writes;
+            uint32_t dtog = en_toggles - last_en_toggles;
+
+            uint8_t cur_ctrl = io_in8(io, REG_CTRL);
+            uint32_t cur_burst = io_in8(io, REG_BURST);
+            uint32_t cur_period = io_in32(io, REG_PERIOD_US);
+
+            printf("storm: handled=%llu (+%llu) dpulses=%llu dtimer_cb=%u dcfg=%u dtog=%u ctrl=0x%02x status=0x%02x badge=0x%lx burst=%u period-us=%u total_pulses=%llu\n",
+                   (unsigned long long)handled,
+                   (unsigned long long)report_every_handled,
+                   (unsigned long long)dpulses,
+                   (unsigned)dtimer_cb,
+                   (unsigned)dcfg,
+                   (unsigned)dtog,
+                   (unsigned)cur_ctrl,
+                   (unsigned)last_status,
+                   (unsigned long)last_badge,
+                   (unsigned)cur_burst,
+                   (unsigned)cur_period,
+                   (unsigned long long)pulses);
+
+            last_pulses = pulses;
+            last_timer_cb = timer_cb;
+            last_cfg_writes = cfg_writes;
+            last_en_toggles = en_toggles;
         }
     }
 
